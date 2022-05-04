@@ -19,6 +19,7 @@ import tensorflow.keras.backend as K
 import scipy.signal
 import os
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 class CPPEnv(object):
     def __init__(self,util):
@@ -26,49 +27,57 @@ class CPPEnv(object):
         self.vpsState = [0]*len(self.util.viewpoints)
         self.voxelState = [0]*len(self.util.map.grids)
         self.occupiedCount = len(np.nonzero(self.voxelState)[0])
+        self.vpIdx = 0
 
     def reset(self,vpIdx=0):
+        self.vpIdx = vpIdx
         self.vpsState = [0]*len(self.util.viewpoints)
         self.voxelState = [0]*len(self.util.map.grids)
         self.occupiedCount = len(np.nonzero(self.voxelState)[0])
-        startVp = self.util.viewpoints[vpIdx]
-        self.vpsState[vpIdx] = 1
-        for grid in startVp.gridCover:
+        vp = self.util.viewpoints[vpIdx]
+        self.vpsState[vpIdx] += 1
+        for grid in vp.gridCover:
             self.voxelState[grid.id] = 1
 
+        coverage = self.coverage()
         nbvps = self.util.neighbors(vpIdx)
-        obs = [startVp.location[0], startVp.location[1], startVp.location[2]]
+        obs = [vp.location[0], vp.location[1], vp.location[2], self.vpsState[vpIdx]]
         for i in nbvps:
             v = self.util.viewpoints[i]
             obs.append(v.location[0])
             obs.append(v.location[1])
             obs.append(v.location[2])
+            obs.append(self.vpsState[i])
 
-        return obs, nbvps
+        return vp, nbvps, obs, coverage
 
     def step(self, vpIdx):
         # move to new vp and update the status
-        self.vpsState[vpIdx] = 1
+        dist = vpDistance(self.util.viewpoints[self.vpIdx], self.util.viewpoints[vpIdx])
+        self.vpIdx = vpIdx
+
+        self.vpsState[vpIdx] += 1
         vp = self.util.viewpoints[vpIdx]
         for grid in vp.gridCover:
             self.voxelState[grid.id] = 1
 
         # calcuate reward
         occupiedCount_new = len(np.nonzero(self.voxelState)[0])
-        reward = 100.0*(occupiedCount_new - self.occupiedCount)/len(self.util.map.grids) - 0.1
+        reward = 100.0*(occupiedCount_new - self.occupiedCount)/len(self.util.map.grids) - 0.1 - 10*(self.vpsState[self.vpIdx]-1)
         self.occupiedCount = occupiedCount_new
 
         # return
         coverage = self.coverage()
         nbvps = self.util.neighbors(vpIdx)
-        obs = [vp.location[0],vp.location[1],vp.location[2]]
+        obs = [vp.location[0],vp.location[1],vp.location[2],self.vpsState[vpIdx]]
         for i in nbvps:
             v = self.util.viewpoints[i]
             obs.append(v.location[0])
             obs.append(v.location[1])
             obs.append(v.location[2])
+            obs.append(self.vpsState[i])
 
-        # print(vpIdx, reward, coverage)
+        # print(vpIdx, nbvps, reward, obs, coverage)
         return vp, nbvps, reward, obs, coverage
 
     def coverage(self):
@@ -272,10 +281,47 @@ class PPOAgent:
         self.Critic.fit(states, returns, iter_c, batch_size)
 
 
+def draw(fig, env, agent, map):
+    ax = fig.add_subplot(111)
+    map.plotMap(ax)
+    plt.draw()
+
+    vp, nbvps, obs, coverage = env.reset(0)
+
+    vp.plotView(ax,type=2)
+    plt.draw()
+    plt.pause(0.5)
+
+    epReturn, epLength, dist = 0.0, 0.0, 0.0
+    for step in range(30):
+        pred, act, val = agent.action([obs])
+        vpIdx = nbvps[act]
+        nvp, nbvps, r, n_obs, coverage = env.step(vpIdx)
+
+        vp.plotView(ax,type=2)
+        plt.draw()
+        plt.pause(0.5)
+
+        dist += vpDistance(vp, nvp)
+        epReturn += r
+        epLength += 1
+        vp = nvp
+        obs = n_obs
+        if coverage == 1.0:
+            break;
+
+    plt.text(-3,-5,"Done with {:.2f} meters traveling {} vps.".format(dist,int(epLength+1)))
+    plt.text(-3,-7,"Total reward {:.2f}".format(epReturn))
+    plt.draw()
+    plt.pause(1)
+    ax.cla()
+    plt.clf()
+
+
 def getParameters():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cn', type=float, default=0.9) # control parameter for neighbors choice
-    parser.add_argument('--ad', type=int, default=4) # action dimenstion, how many neighbors
+    parser.add_argument('--ad', type=int, default=8) # action dimenstion, how many neighbors
     parser.add_argument('--max_ep', type=int, default=10000)
 
     return parser.parse_args()
@@ -285,8 +331,8 @@ if __name__ == "__main__":
     args = getParameters()
 
     map = GridMap()
-    map.makeMap(20,20,1)
-    vps = generateViewPoints(gridMap = map,fov = (40.0,40.0), resolution=1.0)
+    map.makeMap(30,30,1)
+    vps = generateViewPoints(gridMap = map,fov = (60.0,60.0), resolution=1.0)
     util = ViewPointUtil(map,vps,nb=args.ad,overlapRatio=args.cn)
 
     model_dir = os.path.join(sys.path[0],'saved',datetime.now().strftime("%Y-%m-%d-%H-%M"))
@@ -299,16 +345,17 @@ if __name__ == "__main__":
     train_freq = 500
     env = CPPEnv(util)
     action_size = args.ad
-    max_step = 50
-    state_dim = 3*(action_size+1) # x,y,z of the vp and its neighborhood vps
-    agent = PPOAgent(state_dim=state_dim, action_size=action_size, clip_ratio=0.2, lr_a=1e-4, lr_c=3e-4, beta=0.001)
+    max_step = 30
+    state_dim = 4*(action_size+1) # x,y,z of the vp and its neighborhood vps
+    agent = PPOAgent(state_dim=state_dim, action_size=action_size, clip_ratio=0.2, lr_a=1e-3, lr_c=3e-3, beta=0.01)
     buffer = ReplayBuffer(input_shape=state_dim, action_size=action_size, size=buffer_cap)
 
+    fig = plt.figure(figsize=(map.height/5,map.width/5)) # inch
 
     success_counter = 0
     for ep in range(args.max_ep):
-        vpIdx = 0
-        obs, nbvps = env.reset(vpIdx)
+        vpIdx = 0 #np.random.randint(len(vps))
+        vp, nbvps, obs, coverage = env.reset(vpIdx)
         epReturn, epLength = 0, 0
         for step in range(max_step):
             pred, act, val = agent.action([obs])
@@ -323,10 +370,13 @@ if __name__ == "__main__":
                 break;
 
         tf.summary.scalar("episode total reward", epReturn, step=ep+1)
-        print("Episode:{},EpReturn:{},EpLength:{},Success:{}".format(ep+1, epReturn, epLength, success_counter))
+        print("Episode:{},EpReturn:{:.4f},EpLength:{},Success:{}".format(ep+1, epReturn, epLength, success_counter))
 
         buffer.ep_update(gamma=0.99, lamda=0.97)
         size = buffer.size()
         if size >= train_freq or (ep+1) == args.max_ep:
             print("ppo training with ",size," experiences...")
-            agent.train(data=buffer.get(), batch_size=size, iter_a=80, iter_c=80)
+            agent.train(data=buffer.get(), batch_size=size, iter_a=120, iter_c=120)
+
+        if ep % 100 == 0:
+            draw(fig, env, agent, map)
