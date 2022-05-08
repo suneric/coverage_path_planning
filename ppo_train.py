@@ -36,19 +36,18 @@ class CPPEnv(object):
         self.occupiedCount = len(np.nonzero(self.voxelState)[0])
         vp = self.util.viewpoints[vpIdx]
         self.vpsState[vpIdx] += 1
+
+        coverState = [0]*len(self.util.map.grids)
         for grid in vp.gridCover:
-            self.voxelState[grid.id] = 1
+            self.voxelState[grid.id] += 1
+            coverState[grid.id] += 1
 
         coverage = self.coverage()
         nbvps = self.util.neighbors(vpIdx)
-        obs = [vp.location[0], vp.location[1], vp.location[2], self.vpsState[vpIdx]]
-        for i in nbvps:
-            v = self.util.viewpoints[i]
-            obs.append(v.location[0])
-            obs.append(v.location[1])
-            obs.append(v.location[2])
-            obs.append(self.vpsState[i])
 
+        obs = np.zeros((2,len(self.util.map.grids)))
+        obs[0,:] = self.voxelState
+        obs[1,:] = coverState
         return vp, nbvps, obs, coverage
 
     def step(self, vpIdx):
@@ -58,25 +57,23 @@ class CPPEnv(object):
 
         self.vpsState[vpIdx] += 1
         vp = self.util.viewpoints[vpIdx]
+
+        coverState = [0]*len(self.util.map.grids)
         for grid in vp.gridCover:
-            self.voxelState[grid.id] = 1
+            self.voxelState[grid.id] += 1
+            coverState[grid.id] += 1
 
         # calcuate reward
         occupiedCount_new = len(np.nonzero(self.voxelState)[0])
-        reward = 100.0*(occupiedCount_new - self.occupiedCount)/len(self.util.map.grids) - 0.1 - 10*(self.vpsState[self.vpIdx]-1)
+        reward = 100.0*(occupiedCount_new - self.occupiedCount)/len(self.util.map.grids) - 1 - 0.1*(self.vpsState[self.vpIdx]-1)
         self.occupiedCount = occupiedCount_new
 
         # return
         coverage = self.coverage()
         nbvps = self.util.neighbors(vpIdx)
-        obs = [vp.location[0],vp.location[1],vp.location[2],self.vpsState[vpIdx]]
-        for i in nbvps:
-            v = self.util.viewpoints[i]
-            obs.append(v.location[0])
-            obs.append(v.location[1])
-            obs.append(v.location[2])
-            obs.append(self.vpsState[i])
-
+        obs = np.zeros((2,len(self.util.map.grids)))
+        obs[0,:] = self.voxelState
+        obs[1,:] = coverState
         # print(vpIdx, nbvps, reward, obs, coverage)
         return vp, nbvps, reward, obs, coverage
 
@@ -89,7 +86,7 @@ the buffer will be used for update the policy
 """
 class ReplayBuffer:
     def __init__(self, input_shape, action_size, size=1000):
-        self.obs_buf = np.zeros((size, input_shape), dtype=np.float32) # states
+        self.obs_buf = np.zeros([size]+list(input_shape), dtype=np.float32) # states
         self.act_buf = np.zeros((size, action_size), dtype=np.float32) # action, based on stochasitc policy with teh probability
         self.rew_buf = np.zeros(size, dtype=np.float32) # step reward
         self.pred_buf = np.zeros((size, action_size), dtype=np.float32) # prediction: action probability, output of actor net
@@ -150,9 +147,9 @@ Agent NN
 """
 def mlp_net(inputs_dim, outputs_dim, outputs_activation='softmax'):
     inputs = keras.Input(shape=inputs_dim)
-    x = layers.Dense(128, activation = 'relu')(inputs)
-    x = layers.Dense(64, activation = 'relu')(x)
-    x = layers.Dense(32, activation = 'relu')(x)
+    x = layers.Dense(256, activation = 'relu')(inputs)
+    x = layers.Dense(128, activation = 'relu')(x)
+    x = layers.Flatten()(x)
     outputs = layers.Dense(outputs_dim, activation = outputs_activation)(x)
     return keras.Model(inputs=inputs, outputs=outputs)
 
@@ -260,9 +257,9 @@ class PPOAgent:
         self.Critic = Critic_Model(state_dim,lr_c)
 
     def action(self, state):
-        pred = np.squeeze(self.Actor.predict(state), axis=0)
+        pred = np.squeeze(self.Actor.predict(np.expand_dims(state,axis=0)), axis=0)
         act = np.random.choice(self.action_size,p=pred) # index of actions
-        val = np.squeeze(self.Critic.predict(state), axis=0)
+        val = np.squeeze(self.Critic.predict(np.expand_dims(state,axis=0)), axis=0)
         # print("prediction, action, value:", pred, act, val)
         return pred, act, val
 
@@ -293,8 +290,8 @@ def draw(fig, env, agent, map):
     plt.pause(0.5)
 
     epReturn, epLength, dist = 0.0, 0.0, 0.0
-    for step in range(30):
-        pred, act, val = agent.action([obs])
+    for step in range(50):
+        pred, act, val = agent.action(obs)
         vpIdx = nbvps[act]
         nvp, nbvps, r, n_obs, coverage = env.step(vpIdx)
 
@@ -312,6 +309,7 @@ def draw(fig, env, agent, map):
 
     plt.text(-3,-5,"Done with {:.2f} meters traveling {} vps.".format(dist,int(epLength+1)))
     plt.text(-3,-7,"Total reward {:.2f}".format(epReturn))
+    plt.text(-3,-9,"Coverage {:.2f}".format(env.coverage()))
     plt.draw()
     plt.pause(1)
     ax.cla()
@@ -321,7 +319,7 @@ def draw(fig, env, agent, map):
 def getParameters():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cn', type=float, default=0.9) # control parameter for neighbors choice
-    parser.add_argument('--ad', type=int, default=8) # action dimenstion, how many neighbors
+    parser.add_argument('--ad', type=int, default=4) # action dimenstion, how many neighbors
     parser.add_argument('--max_ep', type=int, default=10000)
 
     return parser.parse_args()
@@ -345,20 +343,20 @@ if __name__ == "__main__":
     train_freq = 500
     env = CPPEnv(util)
     action_size = args.ad
-    max_step = 30
-    state_dim = 4*(action_size+1) # x,y,z of the vp and its neighborhood vps
-    agent = PPOAgent(state_dim=state_dim, action_size=action_size, clip_ratio=0.2, lr_a=1e-3, lr_c=3e-3, beta=0.01)
+    max_step = 50
+    state_dim = (2,len(util.map.grids))
+    agent = PPOAgent(state_dim=state_dim, action_size=action_size, clip_ratio=0.2, lr_a=1e-4, lr_c=3e-4, beta=1e-4)
     buffer = ReplayBuffer(input_shape=state_dim, action_size=action_size, size=buffer_cap)
 
     fig = plt.figure(figsize=(map.height/5,map.width/5)) # inch
 
     success_counter = 0
     for ep in range(args.max_ep):
-        vpIdx = 0 #np.random.randint(len(vps))
+        vpIdx = np.random.randint(len(vps))
         vp, nbvps, obs, coverage = env.reset(vpIdx)
         epReturn, epLength = 0, 0
         for step in range(max_step):
-            pred, act, val = agent.action([obs])
+            pred, act, val = agent.action(obs)
             vpIdx = nbvps[act]
             vp, nbvps, r, n_obs, coverage = env.step(vpIdx)
             buffer.store(obs,tf.one_hot(act,action_size).numpy(),r,pred,val)
@@ -370,7 +368,7 @@ if __name__ == "__main__":
                 break;
 
         tf.summary.scalar("episode total reward", epReturn, step=ep+1)
-        print("Episode:{},EpReturn:{:.4f},EpLength:{},Success:{}".format(ep+1, epReturn, epLength, success_counter))
+        print("Episode:{},EpReturn:{:.2f},EpLength:{},Coverage:{:.2f},Success:{}".format(ep+1, epReturn, epLength, env.coverage(), success_counter))
 
         buffer.ep_update(gamma=0.99, lamda=0.97)
         size = buffer.size()
